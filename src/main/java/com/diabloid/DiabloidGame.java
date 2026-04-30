@@ -12,8 +12,15 @@ import java.awt.event.KeyEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.geom.Ellipse2D;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.EnumMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
@@ -23,17 +30,17 @@ import java.util.Set;
 public class DiabloidGame {
     public static void main(String[] args) {
         SwingUtilities.invokeLater(() -> {
-            JFrame frame = new JFrame("Java Survivors");
+            JFrame frame = new JFrame("JavaSurvivors");
             frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
             frame.setResizable(false);
-            frame.setContentPane(new GamePanel());
+            frame.setContentPane(new com.diabloid.GamePanel());
             frame.pack();
             frame.setLocationRelativeTo(null);
             frame.setVisible(true);
         });
     }
 
-    private static final class GamePanel extends JPanel implements Runnable {
+    static final class GamePanel extends JPanel implements Runnable {
         private static Image playerSprite;
         private static Image enemyNormalSprite;
         private static Image enemyTankSprite;
@@ -46,13 +53,13 @@ public class DiabloidGame {
         private static final double DASH_DURATION = 0.15;
         private static final double DASH_COOLDOWN = 1.5;
 
-        private final Random rng = new Random();
+        final Random rng = new Random();
         private final Thread gameThread;
 
-        private boolean up;
-        private boolean down;
-        private boolean left;
-        private boolean right;
+        boolean up;
+        boolean down;
+        boolean left;
+        boolean right;
 
         private boolean isDashing = false;
         private double dashTimer = 0;
@@ -64,32 +71,48 @@ public class DiabloidGame {
         GameState gameState = GameState.MENU;
         UpgradeState upgradeState = UpgradeState.NONE;
 
-        private final Player player = new Player();
+        final Player player = new Player();
         private final List<Enemy> enemies = new ArrayList<>();
         private final List<Projectile> projectiles = new ArrayList<>();
         private final List<XpOrb> xpOrbs = new ArrayList<>();
         private final List<DamageNumber> damageNumbers = new ArrayList<>();
+        private final List<StatusEffect> playerEffects = new ArrayList<>();
+        final List<Particle> particles = new ArrayList<>();
         private final List<String> upgradeChoices = new ArrayList<>();
+        private final List<String> shopChoices = new ArrayList<>();
         private final Set<WeaponType> unlockedWeapons = new HashSet<>();
+        private final Set<String> permanentShopUpgrades = new HashSet<>();
+        private final EnumMap<PerkBranch, List<String>> branchUpgrades = new EnumMap<>(PerkBranch.class);
+        private final EnumMap<WeaponType, Double> extraWeaponCooldowns = new EnumMap<>(WeaponType.class);
 
         // Специальные эффекты для отрисовки
         private final List<LightningEffect> chainLightnings = new ArrayList<>();
         private final List<SawBladeEffect> sawBlades = new ArrayList<>();
+        private final WeaponManager weaponManager = new WeaponManager(this);
+        private final EnemySpawner enemySpawner = new EnemySpawner(this);
+        private final ParticleSystem particleSystem = new ParticleSystem(this);
+        private final SaveSystem saveSystem = new SaveSystem();
+        private SaveData saveData = new SaveData();
 
         private double worldTime;
         private double spawnTimer;
         private double contactDamageTimer;
         private int score;
         private int pendingLevelUps;
+        private int wave;
+        private double waveTimer;
+        private double bossTimer = 180.0;
+        private int shotKillStreak;
+        private double noDamageTime;
+        private int selectedMenuAction = 0; // 0 - новая, 1 - загрузка
+        private int selectedCharacterIdx = 0;
+        private boolean characterSelectActive = false;
+        private final List<CharacterDef> characters = new ArrayList<>();
+        private int runCoins = 0;
+        private final List<CoinPickup> mapCoins = new ArrayList<>();
+        private double coinSpawnTimer = 5.0;
 
-        private final String[] statUpgrades = {
-                "Сила +20%", "Скорость атаки +20%", "Скорость движения +15%",
-                "Макс. HP +20", "Регенерация +0.5", "Магнит +20%",
-                "Броня +8%", "Скорость снаряда +20%", "Размер снаряда +20%",
-                "Урон +5", "Кол-во снарядов +1"
-        };
-
-        private GamePanel() {
+        GamePanel() {
             loadAssets();
             setPreferredSize(new Dimension(WIDTH, HEIGHT));
             setFocusable(true);
@@ -98,6 +121,9 @@ public class DiabloidGame {
 
             addMouseListener(new MouseHandler());
             addMouseMotionListener(new MouseHandler());
+            initBranchUpgradePools();
+            initCharacters();
+            saveData = saveSystem.load();
 
             gameThread = new Thread(this, "game-loop");
             gameThread.start();
@@ -153,8 +179,15 @@ public class DiabloidGame {
             if (gameState == GameState.MENU || gameState == GameState.GAME_OVER || upgradeState == UpgradeState.PAUSED_FOR_UPGRADE) {
                 return;
             }
+            if (upgradeState == UpgradeState.PAUSED_FOR_SHOP) {
+                return;
+            }
 
             worldTime += dt;
+            waveTimer += dt;
+            noDamageTime += dt;
+            saveData.bestNoDamageSeconds = Math.max(saveData.bestNoDamageSeconds, noDamageTime);
+            updateWaveProgress();
 
             if (isDashing) {
                 dashTimer -= dt;
@@ -169,20 +202,95 @@ public class DiabloidGame {
 
             player.heal(dt);
             player.updateMovement(dt, up, down, left, right, WIDTH, HEIGHT);
+            updatePlayerStatusEffects(dt);
+            particleSystem.spawnFootsteps(dt);
+            particleSystem.updateParticles(dt);
+            updateEnemyStatusEffects(dt);
 
             // Обновление активных эффектов
             updateChainLightning(dt);
             updateSawBlades(dt);
 
-            updateWeapons(dt);
-            spawnEnemies(dt);
+            weaponManager.updateWeapons(dt);
+            enemySpawner.spawnEnemies(dt);
             updateEnemies(dt);
             updateProjectiles(dt);
             updateXpOrbs(dt);
+            updateCoins(dt);
             updateDamageNumbers(dt);
         }
 
-        private void updateWeapons(double dt) {
+        private void updateCoins(double dt) {
+            coinSpawnTimer -= dt;
+            if (coinSpawnTimer <= 0) {
+                coinSpawnTimer = 4.0 + rng.nextDouble() * 4.0;
+                mapCoins.add(new CoinPickup(30 + rng.nextDouble() * (WIDTH - 60), 30 + rng.nextDouble() * (HEIGHT - 60), 1 + rng.nextInt(4)));
+            }
+            Iterator<CoinPickup> it = mapCoins.iterator();
+            while (it.hasNext()) {
+                CoinPickup c = it.next();
+                if (distanceSq(c.x, c.y, player.x, player.y) <= (player.radius + 8) * (player.radius + 8)) {
+                    it.remove();
+                    runCoins += c.value;
+                    saveData.totalCoins += c.value;
+                }
+            }
+        }
+
+        private void initBranchUpgradePools() {
+            branchUpgrades.put(PerkBranch.ATTACK, List.of(
+                    "Сила +20%", "Скорость атаки +20%", "Урон +5", "Кол-во снарядов +1",
+                    "Оружие: Ледяная волна", "Оружие: Токсичный дротик", "Оружие: Огненный шар"
+            ));
+            branchUpgrades.put(PerkBranch.DEFENSE, List.of(
+                    "Макс. HP +20", "Броня +8%", "Щит +30", "Регенерация +0.5"
+            ));
+            branchUpgrades.put(PerkBranch.SUPPORT, List.of(
+                    "Скорость движения +15%", "Магнит +20%", "Скорость снаряда +20%", "Размер снаряда +20%"
+            ));
+        }
+
+        private void initCharacters() {
+            if (!characters.isEmpty()) return;
+            characters.add(new CharacterDef("Astra", 0, WeaponType.MAGIC_BOLT, 1.0, 1.0));
+            characters.add(new CharacterDef("Vulcan", 100, WeaponType.FLAME_ORB, 1.12, 0.95));
+            characters.add(new CharacterDef("Glacia", 250, WeaponType.FROST_NOVA, 1.0, 1.08));
+            characters.add(new CharacterDef("Venom", 500, WeaponType.TOXIC_DART, 0.95, 1.15));
+            characters.add(new CharacterDef("Storm", 900, WeaponType.CHAIN_LIGHTNING, 1.10, 1.0));
+            characters.add(new CharacterDef("Blade", 1400, WeaponType.SAW_BLADE, 1.18, 0.92));
+            characters.add(new CharacterDef("Titan", 2200, WeaponType.PIERCE_LANCE, 1.25, 0.82));
+            characters.add(new CharacterDef("Aura", 3400, WeaponType.DAMAGE_AURA, 0.9, 1.2));
+            characters.add(new CharacterDef("Pulse", 5500, WeaponType.PULSE_RING, 1.05, 1.05));
+            characters.add(new CharacterDef("Oracle", 10000, WeaponType.TRIPLE_CAST, 1.15, 1.12));
+            if (saveData.unlockedCharacters.isEmpty()) {
+                saveData.unlockedCharacters.add("Astra");
+            }
+        }
+
+        private void updateWaveProgress() {
+            bossTimer -= 1.0 / 120.0;
+            if (bossTimer <= 0) {
+                bossTimer = 180.0;
+                enemies.add(spawnBoss());
+            }
+            if (waveTimer >= 30.0) {
+                waveTimer = 0;
+                wave++;
+                if (wave % 3 == 0) {
+                    rollShopChoices();
+                    upgradeState = UpgradeState.PAUSED_FOR_SHOP;
+                }
+            }
+        }
+
+        private Enemy spawnBoss() {
+            Enemy boss = new Enemy(WIDTH * 0.5, -80, 38, 1800 + wave * 120, 68, 14 + wave * 1.2, 45);
+            boss.kind = EnemyKind.BOSS;
+            boss.score = 600 + wave * 40;
+            return boss;
+        }
+
+        void updateWeapons(double dt) {
             if (enemies.isEmpty()) {
                 return;
             }
@@ -231,9 +339,66 @@ public class DiabloidGame {
                     player.sawCooldown = Math.max(0.20, 1.35 / player.attackSpeedMultiplier);
                 }
             }
+            if (unlockedWeapons.contains(WeaponType.FROST_NOVA)) {
+                player.frostCooldown -= dt;
+                if (player.frostCooldown <= 0) {
+                    shootFrostNova();
+                    player.frostCooldown = Math.max(0.25, 2.10 / player.attackSpeedMultiplier);
+                }
+            }
+            if (unlockedWeapons.contains(WeaponType.TOXIC_DART)) {
+                player.toxicCooldown -= dt;
+                if (player.toxicCooldown <= 0) {
+                    shootToxicDart();
+                    player.toxicCooldown = Math.max(0.14, 0.72 / player.attackSpeedMultiplier);
+                }
+            }
+            if (unlockedWeapons.contains(WeaponType.FLAME_ORB)) {
+                player.flameCooldown -= dt;
+                if (player.flameCooldown <= 0) {
+                    shootFlameOrb();
+                    player.flameCooldown = Math.max(0.18, 0.95 / player.attackSpeedMultiplier);
+                }
+            }
+            updateExtraWeapons(dt);
+        }
+
+        private void updateExtraWeapons(double dt) {
+            for (WeaponType weapon : unlockedWeapons) {
+                if (!isExtraWeapon(weapon)) continue;
+                double cd = extraWeaponCooldowns.getOrDefault(weapon, 0.1) - dt;
+                if (cd <= 0) {
+                    fireExtraWeapon(weapon);
+                    cd = Math.max(0.20, 1.35 / player.attackSpeedMultiplier);
+                }
+                extraWeaponCooldowns.put(weapon, cd);
+            }
+        }
+
+        private boolean isExtraWeapon(WeaponType weapon) {
+            return weapon.ordinal() >= WeaponType.FIRE_WAVE.ordinal();
+        }
+
+        private void fireExtraWeapon(WeaponType weapon) {
+            shotKillStreak = 0;
+            Enemy target = findNearestEnemy();
+            if (target == null) return;
+            Projectile p = projectileTowards(target, 13.5, 5.5, 560.0, 1);
+            if (p == null) return;
+            switch (weapon) {
+                case FIRE_WAVE, FIRE_LANCE, FIRE_METEOR -> p.appliesBurn = true;
+                case ICE_SHARD, ICE_SPIKE, ICE_STORM -> p.appliesSlow = true;
+                case WATER_JET, WATER_ORB, WATER_TIDE -> p.life = 2.4;
+                case EARTH_SPIKE, EARTH_QUAKE, EARTH_BLADE -> p.radius *= 1.35;
+                case THUNDER_SPEAR, THUNDER_FIELD -> p.damage *= 1.20;
+                case SHADOW_SCYTHE -> p.pierce = 3;
+                default -> { }
+            }
+            projectiles.add(p);
         }
 
         private void shootMagicBolt() {
+            shotKillStreak = 0;
             Enemy target = findNearestEnemy();
             if (target == null) return;
 
@@ -263,7 +428,7 @@ public class DiabloidGame {
                     double vy = Math.sin(angle) * speed;
 
                     double radius = 6.0 * player.projectileSizeMultiplier;
-                    double damage = (18.0 * player.damageMultiplier) + player.flatDamageBonus;
+                    double damage = (18.0 * totalDamageMultiplier()) + player.flatDamageBonus;
 
                     projectiles.add(new Projectile(player.x, player.y, vx, vy, damage, radius, 0));
                 }
@@ -273,6 +438,7 @@ public class DiabloidGame {
         }
 
         private void shootTripleCast() {
+            shotKillStreak = 0;
             Enemy target = findNearestEnemy();
             if (target == null) return;
 
@@ -295,13 +461,14 @@ public class DiabloidGame {
                 double vy = Math.sin(angle) * speed;
 
                 double radius = 5.5 * player.projectileSizeMultiplier;
-                double damage = (12.0 * player.damageMultiplier) + player.flatDamageBonus;
+                double damage = (12.0 * totalDamageMultiplier()) + player.flatDamageBonus;
 
                 projectiles.add(new Projectile(player.x, player.y, vx, vy, damage, radius, 0));
             }
         }
 
         private void shootPulseRing() {
+            shotKillStreak = 0;
             int baseCount = 10;
             int totalCount = (int) Math.round(baseCount + player.multishotMultiplier);
 
@@ -313,13 +480,14 @@ public class DiabloidGame {
                 double vy = Math.sin(angle) * speed;
 
                 double radius = 5.0 * player.projectileSizeMultiplier;
-                double damage = (14.0 * player.damageMultiplier) + player.flatDamageBonus;
+                double damage = (14.0 * totalDamageMultiplier()) + player.flatDamageBonus;
 
                 projectiles.add(new Projectile(player.x, player.y, vx, vy, damage, radius, 0));
             }
         }
 
         private void shootPierceLance() {
+            shotKillStreak = 0;
             Enemy target = findNearestEnemy();
             if (target == null) return;
 
@@ -345,7 +513,7 @@ public class DiabloidGame {
                 double vy = Math.sin(angle) * speed;
 
                 double radius = 7.0 * player.projectileSizeMultiplier;
-                double damage = (24.0 * player.damageMultiplier) + player.flatDamageBonus;
+                double damage = (24.0 * totalDamageMultiplier()) + player.flatDamageBonus;
 
                 // Копья имеют pierce
                 projectiles.add(new Projectile(player.x, player.y, vx, vy, damage, radius, 2));
@@ -359,7 +527,7 @@ public class DiabloidGame {
             }
             player.auraTickCooldown = 0.28;
             double auraRadius = player.auraRadius * player.projectileSizeMultiplier;
-            double auraDamage = (7.5 * player.damageMultiplier) + player.flatDamageBonus * 0.6;
+            double auraDamage = (7.5 * totalDamageMultiplier()) + player.flatDamageBonus * 0.6;
             for (Enemy enemy : new ArrayList<>(enemies)) {
                 if (distanceSq(player.x, player.y, enemy.x, enemy.y) <= auraRadius * auraRadius) {
                     damageEnemy(enemy, auraDamage);
@@ -368,6 +536,7 @@ public class DiabloidGame {
         }
 
         private void castChainLightning() {
+            shotKillStreak = 0;
             Enemy first = findNearestEnemy();
             if (first == null) return;
 
@@ -394,7 +563,7 @@ public class DiabloidGame {
             // Создаем эффект молнии для отрисовки с передачей всех целей
             chainLightnings.add(new LightningEffect(first, second, third));
 
-            double baseDamage = (26.0 * player.damageMultiplier) + player.flatDamageBonus;
+            double baseDamage = (26.0 * totalDamageMultiplier()) + player.flatDamageBonus;
             damageEnemy(first, baseDamage);
             if (second != null) damageEnemy(second, baseDamage * 0.72);
             if (third != null) damageEnemy(third, baseDamage * 0.5);
@@ -412,6 +581,7 @@ public class DiabloidGame {
         }
 
         private void shootSawBlade() {
+            shotKillStreak = 0;
             Enemy target = findNearestEnemy();
             if (target == null) return;
 
@@ -430,11 +600,8 @@ public class DiabloidGame {
                 double angle = baseAngle + offset;
 
                 double speed = 500.0 * player.projectileSpeedMultiplier;
-                double vx = Math.cos(angle) * speed;
-                double vy = Math.sin(angle) * speed;
-
                 double radius = 8.0 * player.projectileSizeMultiplier;
-                double damage = (20.0 * player.damageMultiplier) + player.flatDamageBonus;
+                double damage = (20.0 * totalDamageMultiplier()) + player.flatDamageBonus;
 
                 // Добавляем эффект пилы для отрисовки
                 sawBlades.add(new SawBladeEffect(player.x, player.y, angle, speed, radius, damage, 5));
@@ -478,6 +645,54 @@ public class DiabloidGame {
             }
         }
 
+        private void shootFrostNova() {
+            shotKillStreak = 0;
+            int count = 12;
+            for (int i = 0; i < count; i++) {
+                double angle = (Math.PI * 2 / count) * i;
+                double speed = 360.0 * player.projectileSpeedMultiplier;
+                Projectile p = new Projectile(player.x, player.y, Math.cos(angle) * speed, Math.sin(angle) * speed,
+                        (10.0 * totalDamageMultiplier()) + player.flatDamageBonus, 5.2 * player.projectileSizeMultiplier, 0);
+                p.appliesSlow = true;
+                p.life = 0.85;
+                projectiles.add(p);
+            }
+        }
+
+        private void shootToxicDart() {
+            shotKillStreak = 0;
+            Enemy target = findNearestEnemy();
+            if (target == null) return;
+            Projectile p = projectileTowards(target, 11.0, 4.5, 760.0, 1);
+            if (p != null) {
+                p.appliesPoison = true;
+                projectiles.add(p);
+            }
+        }
+
+        private void shootFlameOrb() {
+            shotKillStreak = 0;
+            Enemy target = findNearestEnemy();
+            if (target == null) return;
+            Projectile p = projectileTowards(target, 16.0, 6.8, 520.0, 0);
+            if (p != null) {
+                p.appliesBurn = true;
+                p.life = 2.2;
+                projectiles.add(p);
+            }
+        }
+
+        private Projectile projectileTowards(Enemy target, double baseDamage, double baseRadius, double baseSpeed, int pierce) {
+            double dx = target.x - player.x;
+            double dy = target.y - player.y;
+            double len = Math.hypot(dx, dy);
+            if (len < 0.001) return null;
+            double speed = baseSpeed * player.projectileSpeedMultiplier;
+            double radius = baseRadius * player.projectileSizeMultiplier;
+            double damage = (baseDamage * totalDamageMultiplier()) + player.flatDamageBonus;
+            return new Projectile(player.x, player.y, (dx / len) * speed, (dy / len) * speed, damage, radius, pierce);
+        }
+
         private Enemy findNearestEnemy() {
             return enemies.stream()
                     .min(Comparator.comparingDouble(e -> distanceSq(player.x, player.y, e.x, e.y)))
@@ -492,11 +707,15 @@ public class DiabloidGame {
 
             double speed = baseSpeed * player.projectileSpeedMultiplier;
             double radius = baseRadius * player.projectileSizeMultiplier;
-            double damage = (baseDamage * player.damageMultiplier) + player.flatDamageBonus;
+            double damage = (baseDamage * totalDamageMultiplier()) + player.flatDamageBonus;
             projectiles.add(new Projectile(player.x, player.y, (dx / len) * speed, (dy / len) * speed, damage, radius, pierce));
         }
 
-        private void spawnEnemies(double dt) {
+        private double totalDamageMultiplier() {
+            return player.damageMultiplier * (1.0 + player.tempDamageBoost);
+        }
+
+        void spawnEnemies(double dt) {
             spawnTimer -= dt;
             if (spawnTimer > 0) {
                 return;
@@ -513,7 +732,7 @@ public class DiabloidGame {
         }
 
         private Enemy spawnEnemy(double difficulty) {
-            boolean tank = rng.nextDouble() < 0.20 + Math.min(0.25, worldTime / 240.0);
+            double roll = rng.nextDouble();
             double side = rng.nextDouble();
             double x;
             double y;
@@ -531,22 +750,79 @@ public class DiabloidGame {
                 y = HEIGHT + 50;
             }
 
-            if (tank) {
-                return new Enemy(x, y, 22, 95 * difficulty, 62 + difficulty * 5, 5 + difficulty * 2, 4 + (int) difficulty);
+            if (roll < 0.12) {
+                Enemy e = new Enemy(x, y, 10, 26 * difficulty, 190 + difficulty * 14, 8 + difficulty * 1.8, 2 + (int) (difficulty * 0.7));
+                e.kind = EnemyKind.SPEEDER;
+                return e;
+            } else if (roll < 0.26) {
+                Enemy e = new Enemy(x, y, 18, 55 * difficulty, 92 + difficulty * 8, 4.2 + difficulty * 1.4, 3 + (int) (difficulty * 0.9));
+                e.kind = EnemyKind.SHOOTER;
+                return e;
+            } else if (roll < 0.48) {
+                Enemy e = new Enemy(x, y, 22, 95 * difficulty, 62 + difficulty * 5, 5 + difficulty * 2, 4 + (int) difficulty);
+                e.kind = EnemyKind.TANK;
+                return e;
+            } else {
+                Enemy e = new Enemy(x, y, 14, 40 * difficulty, 105 + difficulty * 8, 3 + difficulty, 2 + (int) (difficulty * 0.8));
+                e.kind = EnemyKind.NORMAL;
+                return e;
             }
-            return new Enemy(x, y, 14, 40 * difficulty, 105 + difficulty * 8, 3 + difficulty, 2 + (int) (difficulty * 0.8));
         }
 
         private void updateEnemies(double dt) {
             for (Enemy e : enemies) {
+                e.attackCooldown -= dt;
+                if (e.kind == EnemyKind.BOSS) {
+                    if (e.hp < 1200) e.phase = 2;
+                    if (e.hp < 600) e.phase = 3;
+                    if (e.attackCooldown <= 0) {
+                        if (e.phase == 1) {
+                            // Взрыв-волна по области
+                            for (int i = 0; i < 18; i++) {
+                                double a = (Math.PI * 2 / 18) * i;
+                                Projectile ep = new Projectile(e.x, e.y, Math.cos(a) * 260, Math.sin(a) * 260, 9 + wave * 0.6, 4, 0);
+                                ep.fromEnemy = true;
+                                projectiles.add(ep);
+                            }
+                            e.attackCooldown = 4.0;
+                        } else if (e.phase == 2) {
+                            enemies.add(spawnEnemy(1.0 + worldTime * 0.01));
+                            enemies.add(spawnEnemy(1.0 + worldTime * 0.01));
+                            e.attackCooldown = 5.5;
+                        } else {
+                            for (int i = 0; i < 4; i++) enemies.add(spawnEnemy(1.1 + worldTime * 0.012));
+                            e.attackCooldown = 6.0;
+                        }
+                    }
+                }
                 double dx = player.x - e.x;
                 double dy = player.y - e.y;
                 double len = Math.hypot(dx, dy);
-                if (len > 0.0001) {
-                    e.x += (dx / len) * e.speed * dt;
-                    e.y += (dy / len) * e.speed * dt;
+                if (len > 0.0001 && e.kind != EnemyKind.SHOOTER) {
+                    e.x += (dx / len) * e.speed * e.speedMultiplier * dt;
+                    e.y += (dy / len) * e.speed * e.speedMultiplier * dt;
+                } else if (e.kind == EnemyKind.SHOOTER) {
+                    double preferred = 180;
+                    if (len > preferred + 20) {
+                        e.x += (dx / len) * e.speed * 0.75 * dt;
+                        e.y += (dy / len) * e.speed * 0.75 * dt;
+                    } else if (len < preferred - 20) {
+                        e.x -= (dx / len) * e.speed * 0.75 * dt;
+                        e.y -= (dy / len) * e.speed * 0.75 * dt;
+                    }
+                    if (e.attackCooldown <= 0 && len > 50) {
+                        Projectile ep = new Projectile(e.x, e.y, (dx / len) * 300, (dy / len) * 300, 7.0 + wave * 0.3, 3.0, 0);
+                        ep.fromEnemy = true;
+                        projectiles.add(ep);
+                        e.attackCooldown = 1.3;
+                    }
                 }
                 e.updateAnimation(dt);
+                if (distanceSq(e.x, e.y, player.x, player.y) <= (e.radius + player.radius + 14) * (e.radius + player.radius + 14)) {
+                    e.attackWindup = Math.min(1.0, e.attackWindup + dt * 3.5);
+                } else {
+                    e.attackWindup = Math.max(0.0, e.attackWindup - dt * 2.0);
+                }
             }
 
             contactDamageTimer -= dt;
@@ -558,10 +834,19 @@ public class DiabloidGame {
                     }
                 }
                 if (sumDamage > 0) {
-                    player.hp -= sumDamage * (1.0 - player.armorReduction);
+                    double incoming = sumDamage * (1.0 - player.armorReduction);
+                    incoming = absorbShieldDamage(incoming);
+                    player.hp -= incoming;
+                    noDamageTime = 0;
                     if (player.hp <= 0) {
                         player.hp = 0;
                         gameState = GameState.GAME_OVER;
+                        saveData.bestNoDamageSeconds = Math.max(saveData.bestNoDamageSeconds, noDamageTime);
+                        saveData.savedRunCoins = runCoins;
+                        saveData.savedScore = score;
+                        saveData.savedWave = wave;
+                        saveData.savedWorldTime = worldTime;
+                        saveSystem.save(saveData);
                     }
                 }
                 contactDamageTimer = CONTACT_DAMAGE_TICK;
@@ -581,6 +866,26 @@ public class DiabloidGame {
                     continue;
                 }
 
+                if (p.fromEnemy) {
+                    if (!isDashing && distanceSq(p.x, p.y, player.x, player.y) <= (p.radius + player.radius) * (p.radius + player.radius)) {
+                        double incoming = absorbShieldDamage(p.damage * (1.0 - player.armorReduction));
+                        player.hp -= incoming;
+                        noDamageTime = 0;
+                        particleSystem.spawnProjectileHitSparks(p.x, p.y);
+                        pi.remove();
+                        if (player.hp <= 0) {
+                            player.hp = 0;
+                            gameState = GameState.GAME_OVER;
+                            saveData.savedRunCoins = runCoins;
+                            saveData.savedScore = score;
+                            saveData.savedWave = wave;
+                            saveData.savedWorldTime = worldTime;
+                            saveSystem.save(saveData);
+                        }
+                    }
+                    continue;
+                }
+
                 Enemy hit = null;
                 for (Enemy e : enemies) {
                     if (distanceSq(p.x, p.y, e.x, e.y) <= (p.radius + e.radius) * (p.radius + e.radius)) {
@@ -591,6 +896,16 @@ public class DiabloidGame {
 
                 if (hit != null) {
                     damageEnemy(hit, p.damage);
+                    particleSystem.spawnProjectileHitSparks(p.x, p.y);
+                    if (p.appliesSlow) {
+                        addEnemyStatus(hit, new StatusEffect(StatusEffectType.SLOW, 2.5, 0.0, 0.45));
+                    }
+                    if (p.appliesBurn) {
+                        addEnemyStatus(hit, new StatusEffect(StatusEffectType.BURN, 3.0, 7.0 * player.damageMultiplier, 0.0));
+                    }
+                    if (p.appliesPoison) {
+                        addPlayerStatus(new StatusEffect(StatusEffectType.POISON, 3.5, 0.0, 0.5));
+                    }
                     if (p.pierce > 0) {
                         p.pierce--;
                     } else {
@@ -608,6 +923,10 @@ public class DiabloidGame {
                 enemies.remove(enemy);
                 score += enemy.score;
                 xpOrbs.add(new XpOrb(enemy.x, enemy.y, enemy.xpValue));
+                shotKillStreak++;
+                particleSystem.spawnKillExplosion(enemy.x, enemy.y);
+                saveData.bestMultiKill = Math.max(saveData.bestMultiKill, shotKillStreak);
+                saveData.highScore = Math.max(saveData.highScore, score);
             }
         }
 
@@ -659,32 +978,38 @@ public class DiabloidGame {
 
         private void rollUpgradeChoices() {
             upgradeChoices.clear();
-            List<String> pool = new ArrayList<>();
-            for (String u : statUpgrades) {
-                pool.add(u);
+            for (PerkBranch branch : PerkBranch.values()) {
+                List<String> pool = new ArrayList<>(branchUpgrades.get(branch));
+                addMissingWeaponsToPool(pool);
+                if (!pool.isEmpty()) {
+                    String pick = pool.get(rng.nextInt(pool.size()));
+                    upgradeChoices.add(branch.title + ": " + pick);
+                }
             }
-            if (!unlockedWeapons.contains(WeaponType.TRIPLE_CAST)) {
-                pool.add("Оружие: Тройной залп");
-            }
-            if (!unlockedWeapons.contains(WeaponType.PULSE_RING)) {
-                pool.add("Оружие: Кольцо импульса");
-            }
-            if (!unlockedWeapons.contains(WeaponType.PIERCE_LANCE)) {
-                pool.add("Оружие: Пронзающее копье");
-            }
-            if (!unlockedWeapons.contains(WeaponType.DAMAGE_AURA)) {
-                pool.add("Оружие: Аура боли");
-            }
-            if (!unlockedWeapons.contains(WeaponType.CHAIN_LIGHTNING)) {
-                pool.add("Оружие: Цепная молния");
-            }
-            if (!unlockedWeapons.contains(WeaponType.SAW_BLADE)) {
-                pool.add("Оружие: Пила");
-            }
-            for (int i = 0; i < 4 && !pool.isEmpty(); i++) {
-                int idx = rng.nextInt(pool.size());
-                upgradeChoices.add(pool.remove(idx));
-            }
+        }
+
+        private void addMissingWeaponsToPool(List<String> pool) {
+            if (!unlockedWeapons.contains(WeaponType.TRIPLE_CAST)) pool.add("Оружие: Тройной залп");
+            if (!unlockedWeapons.contains(WeaponType.PULSE_RING)) pool.add("Оружие: Кольцо импульса");
+            if (!unlockedWeapons.contains(WeaponType.PIERCE_LANCE)) pool.add("Оружие: Пронзающее копье");
+            if (!unlockedWeapons.contains(WeaponType.DAMAGE_AURA)) pool.add("Оружие: Аура боли");
+            if (!unlockedWeapons.contains(WeaponType.CHAIN_LIGHTNING)) pool.add("Оружие: Цепная молния");
+            if (!unlockedWeapons.contains(WeaponType.SAW_BLADE)) pool.add("Оружие: Пила");
+            if (!unlockedWeapons.contains(WeaponType.FIRE_WAVE)) pool.add("Оружие: Огненная волна");
+            if (!unlockedWeapons.contains(WeaponType.FIRE_LANCE)) pool.add("Оружие: Огненное копье");
+            if (!unlockedWeapons.contains(WeaponType.FIRE_METEOR)) pool.add("Оружие: Метеор");
+            if (!unlockedWeapons.contains(WeaponType.ICE_SHARD)) pool.add("Оружие: Ледяной осколок");
+            if (!unlockedWeapons.contains(WeaponType.ICE_SPIKE)) pool.add("Оружие: Ледяной шип");
+            if (!unlockedWeapons.contains(WeaponType.ICE_STORM)) pool.add("Оружие: Ледяной шторм");
+            if (!unlockedWeapons.contains(WeaponType.WATER_JET)) pool.add("Оружие: Водяной поток");
+            if (!unlockedWeapons.contains(WeaponType.WATER_ORB)) pool.add("Оружие: Водяная сфера");
+            if (!unlockedWeapons.contains(WeaponType.WATER_TIDE)) pool.add("Оружие: Прилив");
+            if (!unlockedWeapons.contains(WeaponType.EARTH_SPIKE)) pool.add("Оружие: Каменный шип");
+            if (!unlockedWeapons.contains(WeaponType.EARTH_QUAKE)) pool.add("Оружие: Землетрясение");
+            if (!unlockedWeapons.contains(WeaponType.EARTH_BLADE)) pool.add("Оружие: Земляной клинок");
+            if (!unlockedWeapons.contains(WeaponType.THUNDER_SPEAR)) pool.add("Оружие: Громовое копье");
+            if (!unlockedWeapons.contains(WeaponType.THUNDER_FIELD)) pool.add("Оружие: Грозовое поле");
+            if (!unlockedWeapons.contains(WeaponType.SHADOW_SCYTHE)) pool.add("Оружие: Теневая коса");
         }
 
         private void applyUpgrade(int idx) {
@@ -692,6 +1017,12 @@ public class DiabloidGame {
                 return;
             }
             String picked = upgradeChoices.get(idx);
+            for (PerkBranch branch : PerkBranch.values()) {
+                if (picked.startsWith(branch.title + ": ")) {
+                    picked = picked.substring((branch.title + ": ").length());
+                    break;
+                }
+            }
             if (picked.startsWith("Сила")) {
                 player.damageMultiplier *= 1.20;
             } else if (picked.startsWith("Скорость атаки")) {
@@ -715,6 +1046,8 @@ public class DiabloidGame {
                 player.flatDamageBonus += 5.0;
             } else if (picked.startsWith("Кол-во снарядов")) {
                 player.multishotMultiplier += 1.0;
+            } else if (picked.startsWith("Щит +30")) {
+                addPlayerStatus(new StatusEffect(StatusEffectType.SHIELD, 12.0, 30.0, 0.0));
             } else if (picked.contains("Тройной залп")) {
                 unlockedWeapons.add(WeaponType.TRIPLE_CAST);
             } else if (picked.contains("Кольцо импульса")) {
@@ -727,6 +1060,42 @@ public class DiabloidGame {
                 unlockedWeapons.add(WeaponType.CHAIN_LIGHTNING);
             } else if (picked.contains("Пила")) {
                 unlockedWeapons.add(WeaponType.SAW_BLADE);
+            } else if (picked.contains("Ледяная волна")) {
+                unlockedWeapons.add(WeaponType.FROST_NOVA);
+            } else if (picked.contains("Токсичный дротик")) {
+                unlockedWeapons.add(WeaponType.TOXIC_DART);
+            } else if (picked.contains("Огненный шар")) {
+                unlockedWeapons.add(WeaponType.FLAME_ORB);
+            } else if (picked.contains("Огненная волна")) {
+                unlockedWeapons.add(WeaponType.FIRE_WAVE);
+            } else if (picked.contains("Огненное копье")) {
+                unlockedWeapons.add(WeaponType.FIRE_LANCE);
+            } else if (picked.contains("Метеор")) {
+                unlockedWeapons.add(WeaponType.FIRE_METEOR);
+            } else if (picked.contains("Ледяной осколок")) {
+                unlockedWeapons.add(WeaponType.ICE_SHARD);
+            } else if (picked.contains("Ледяной шип")) {
+                unlockedWeapons.add(WeaponType.ICE_SPIKE);
+            } else if (picked.contains("Ледяной шторм")) {
+                unlockedWeapons.add(WeaponType.ICE_STORM);
+            } else if (picked.contains("Водяной поток")) {
+                unlockedWeapons.add(WeaponType.WATER_JET);
+            } else if (picked.contains("Водяная сфера")) {
+                unlockedWeapons.add(WeaponType.WATER_ORB);
+            } else if (picked.contains("Прилив")) {
+                unlockedWeapons.add(WeaponType.WATER_TIDE);
+            } else if (picked.contains("Каменный шип")) {
+                unlockedWeapons.add(WeaponType.EARTH_SPIKE);
+            } else if (picked.contains("Землетрясение")) {
+                unlockedWeapons.add(WeaponType.EARTH_QUAKE);
+            } else if (picked.contains("Земляной клинок")) {
+                unlockedWeapons.add(WeaponType.EARTH_BLADE);
+            } else if (picked.contains("Громовое копье")) {
+                unlockedWeapons.add(WeaponType.THUNDER_SPEAR);
+            } else if (picked.contains("Грозовое поле")) {
+                unlockedWeapons.add(WeaponType.THUNDER_FIELD);
+            } else if (picked.contains("Теневая коса")) {
+                unlockedWeapons.add(WeaponType.SHADOW_SCYTHE);
             }
 
             pendingLevelUps--;
@@ -736,6 +1105,147 @@ public class DiabloidGame {
                 upgradeState = UpgradeState.NONE;
                 upgradeChoices.clear();
             }
+        }
+
+        private void rollShopChoices() {
+            shopChoices.clear();
+            shopChoices.add("Временный бафф: Сила +35% (на 20с) [160 очков]");
+            shopChoices.add("Временный бафф: Щит +50 (на 15с) [180 очков]");
+            if (!permanentShopUpgrades.contains("PERM_REGEN")) {
+                shopChoices.add("Постоянно: Регенерация +0.4 [300 очков]");
+            } else {
+                shopChoices.add("Постоянно: Броня +4% [320 очков]");
+            }
+        }
+
+        private void applyShopChoice(int idx) {
+            if (idx < 0 || idx >= shopChoices.size()) return;
+            String choice = shopChoices.get(idx);
+            int cost = choice.contains("[300") ? 300 : choice.contains("[320") ? 320 : choice.contains("[180") ? 180 : 160;
+            if (score < cost) return;
+            score -= cost;
+            if (choice.contains("Сила")) {
+                addPlayerStatus(new StatusEffect(StatusEffectType.TEMP_DAMAGE_BOOST, 20.0, 0.35, 0.0));
+            } else if (choice.contains("Щит")) {
+                addPlayerStatus(new StatusEffect(StatusEffectType.SHIELD, 15.0, 50.0, 0.0));
+            } else if (choice.contains("Регенерация")) {
+                permanentShopUpgrades.add("PERM_REGEN");
+                player.regen += 0.4;
+            } else if (choice.contains("Броня")) {
+                player.armorReduction = Math.min(0.80, player.armorReduction + 0.04);
+            }
+            upgradeState = UpgradeState.NONE;
+            shopChoices.clear();
+        }
+
+        private void updateEnemyStatusEffects(double dt) {
+            for (Enemy enemy : new ArrayList<>(enemies)) {
+                enemy.speedMultiplier = 1.0;
+                Iterator<StatusEffect> it = enemy.effects.iterator();
+                while (it.hasNext()) {
+                    StatusEffect effect = it.next();
+                    effect.duration -= dt;
+                    effect.tickTimer -= dt;
+                    if (effect.type == StatusEffectType.SLOW) {
+                        enemy.speedMultiplier = Math.min(enemy.speedMultiplier, 1.0 - effect.modifier);
+                    } else if (effect.type == StatusEffectType.BURN && effect.tickTimer <= 0) {
+                        damageEnemy(enemy, effect.power);
+                        effect.tickTimer = 0.5;
+                    }
+                    if (effect.duration <= 0) {
+                        it.remove();
+                    }
+                }
+            }
+        }
+
+        private void updatePlayerStatusEffects(double dt) {
+            player.tempDamageBoost = 0.0;
+            player.poisonRegenMultiplier = 1.0;
+            player.shieldPoints = 0.0;
+            Iterator<StatusEffect> it = playerEffects.iterator();
+            while (it.hasNext()) {
+                StatusEffect effect = it.next();
+                effect.duration -= dt;
+                if (effect.type == StatusEffectType.POISON) {
+                    player.poisonRegenMultiplier = Math.min(player.poisonRegenMultiplier, effect.modifier);
+                } else if (effect.type == StatusEffectType.SHIELD) {
+                    player.shieldPoints += effect.power;
+                } else if (effect.type == StatusEffectType.TEMP_DAMAGE_BOOST) {
+                    player.tempDamageBoost += effect.power;
+                }
+                if (effect.duration <= 0) {
+                    it.remove();
+                }
+            }
+        }
+
+        private void addEnemyStatus(Enemy enemy, StatusEffect effect) {
+            enemy.effects.add(effect);
+        }
+
+        private void addPlayerStatus(StatusEffect effect) {
+            playerEffects.add(effect);
+        }
+
+        private double absorbShieldDamage(double incoming) {
+            if (incoming <= 0 || player.shieldPoints <= 0) return incoming;
+            double absorbed = Math.min(player.shieldPoints, incoming);
+            player.shieldPoints -= absorbed;
+            incoming -= absorbed;
+            double toRemove = absorbed;
+            Iterator<StatusEffect> it = playerEffects.iterator();
+            while (it.hasNext() && toRemove > 0) {
+                StatusEffect effect = it.next();
+                if (effect.type != StatusEffectType.SHIELD) continue;
+                double cut = Math.min(effect.power, toRemove);
+                effect.power -= cut;
+                toRemove -= cut;
+                if (effect.power <= 0.01) it.remove();
+            }
+            return incoming;
+        }
+
+        private void handleMenuConfirm() {
+            if (!characterSelectActive) {
+                characterSelectActive = true;
+                return;
+            }
+            CharacterDef picked = characters.get(selectedCharacterIdx);
+            if (!saveData.unlockedCharacters.contains(picked.name)) {
+                if (saveData.totalCoins >= picked.cost) {
+                    saveData.totalCoins -= picked.cost;
+                    saveData.unlockedCharacters.add(picked.name);
+                    saveSystem.save(saveData);
+                } else {
+                    return;
+                }
+            }
+            boolean load = selectedMenuAction == 1;
+            startRunWithCharacter(picked, load);
+        }
+
+        private void startRunWithCharacter(CharacterDef picked, boolean load) {
+            resetRun();
+            unlockedWeapons.clear();
+            unlockedWeapons.add(picked.startWeapon);
+            player.damageMultiplier *= picked.damageScale;
+            player.moveSpeed *= picked.speedScale;
+            if (load) {
+                score = saveData.savedScore;
+                wave = Math.max(1, saveData.savedWave);
+                worldTime = Math.max(0, saveData.savedWorldTime);
+                runCoins = saveData.savedRunCoins;
+            } else {
+                runCoins = 0;
+                saveData.savedRunCoins = 0;
+                saveData.savedScore = 0;
+                saveData.savedWave = 1;
+                saveData.savedWorldTime = 0;
+            }
+            saveData.savedCharacter = picked.name;
+            characterSelectActive = false;
+            gameState = GameState.PLAYING;
         }
 
         private void resetRun() {
@@ -748,6 +1258,10 @@ public class DiabloidGame {
             unlockedWeapons.add(WeaponType.MAGIC_BOLT);
             chainLightnings.clear();
             sawBlades.clear();
+            particles.clear();
+            playerEffects.clear();
+            shopChoices.clear();
+            mapCoins.clear();
 
             player.reset();
             worldTime = 0;
@@ -755,6 +1269,13 @@ public class DiabloidGame {
             contactDamageTimer = 0;
             score = 0;
             pendingLevelUps = 0;
+            wave = 1;
+            waveTimer = 0;
+            shotKillStreak = 0;
+            noDamageTime = 0;
+            coinSpawnTimer = 5.0;
+            bossTimer = 180.0;
+            extraWeaponCooldowns.clear();
             isDashing = false;
             dashCooldownTimer = 0;
             gameState = GameState.PLAYING;
@@ -777,6 +1298,8 @@ public class DiabloidGame {
                 drawGameOver(g2);
             } else if (upgradeState == UpgradeState.PAUSED_FOR_UPGRADE) {
                 drawUpgradeOverlay(g2);
+            } else if (upgradeState == UpgradeState.PAUSED_FOR_SHOP) {
+                drawShopOverlay(g2);
             }
         }
 
@@ -784,12 +1307,23 @@ public class DiabloidGame {
             if (bgSprite != null && imagesLoaded) {
                 g2.drawImage(bgSprite, 0, 0, WIDTH, HEIGHT, this);
             } else {
-                g2.setColor(new Color(27, 27, 31));
-                for (int x = 0; x < WIDTH; x += 64) {
-                    for (int y = 0; y < HEIGHT; y += 64) {
+                g2.setColor(new Color(15, 15, 22));
+                g2.fillRect(0, 0, WIDTH, HEIGHT);
+                double offXSlow = (player.x - WIDTH * 0.5) * 0.08;
+                double offYSlow = (player.y - HEIGHT * 0.5) * 0.08;
+                double offXFast = (player.x - WIDTH * 0.5) * 0.20;
+                double offYFast = (player.y - HEIGHT * 0.5) * 0.20;
+                for (int i = 0; i < 140; i++) {
+                    double x = ((i * 97 + worldTime * 9) % (WIDTH + 200)) - 100 - offXSlow;
+                    double y = ((i * 53 + worldTime * 7) % (HEIGHT + 200)) - 100 - offYSlow;
+                    g2.setColor(new Color(180, 180, 230, 110));
+                    g2.fill(new Ellipse2D.Double(x, y, 2, 2));
+                }
+                for (int x = -64; x < WIDTH + 64; x += 64) {
+                    for (int y = -64; y < HEIGHT + 64; y += 64) {
                         int pulse = (int) ((Math.sin((x + y + worldTime * 45) * 0.03) + 1) * 8);
-                        g2.setColor(new Color(26 + pulse, 26 + pulse, 32 + pulse));
-                        g2.fillRect(x, y, 62, 62);
+                        g2.setColor(new Color(30 + pulse, 30 + pulse, 44 + pulse, 120));
+                        g2.fillRect((int) (x - offXFast), (int) (y - offYFast), 62, 62);
                     }
                 }
             }
@@ -834,11 +1368,18 @@ public class DiabloidGame {
                 g2.setColor(new Color(80, 180, 255));
                 g2.fill(new Ellipse2D.Double(orb.x - 4, orb.y - 4, 8, 8));
             }
+            for (CoinPickup coin : mapCoins) {
+                g2.setColor(new Color(250, 210, 70));
+                g2.fill(new Ellipse2D.Double(coin.x - 5, coin.y - 5, 10, 10));
+                g2.setColor(new Color(255, 240, 140, 180));
+                g2.draw(new Ellipse2D.Double(coin.x - 7, coin.y - 7, 14, 14));
+            }
 
             for (Projectile p : projectiles) {
                 g2.setColor(new Color(255, 228, 120));
                 g2.fill(new Ellipse2D.Double(p.x - p.radius, p.y - p.radius, p.radius * 2, p.radius * 2));
             }
+            particleSystem.drawParticles(g2);
 
             for (Enemy e : enemies) {
                 Image spriteToDraw = null;
@@ -888,6 +1429,12 @@ public class DiabloidGame {
                         ));
                     }
                 }
+                if (e.attackWindup > 0.05) {
+                    g2.setColor(new Color(255, 80, 80, (int) (120 * e.attackWindup)));
+                    g2.setStroke(new BasicStroke(2));
+                    double r = e.radius + 6 + e.attackWindup * 8;
+                    g2.draw(new Ellipse2D.Double(e.x - r, e.y - r, r * 2, r * 2));
+                }
             }
 
             if (unlockedWeapons.contains(WeaponType.DAMAGE_AURA)) {
@@ -925,6 +1472,10 @@ public class DiabloidGame {
             g2.drawString("Уровень: " + player.level, 30, 45);
             g2.drawString("Время: " + formatTime(worldTime), 30, 71);
             g2.drawString("Счет: " + score, 30, 97);
+            g2.drawString("Волна: " + wave, 250, 45);
+            g2.drawString("xKill: " + saveData.bestMultiKill, 250, 71);
+            g2.drawString("NoHit: " + formatTime(saveData.bestNoDamageSeconds), 250, 97);
+            g2.drawString("Монеты: " + runCoins + " (банк " + saveData.totalCoins + ")", 30, 125);
 
             int hpBarWidth = 220;
             g2.setColor(new Color(75, 25, 25));
@@ -947,11 +1498,11 @@ public class DiabloidGame {
             if (dashCooldownTimer > 0) {
                 g2.setColor(new Color(100, 100, 100));
                 g2.setFont(new Font("Dialog", Font.PLAIN, 14));
-                g2.drawString("Рывок: " + (int)Math.ceil(dashCooldownTimer), 30, 125);
+                g2.drawString("Рывок: " + (int)Math.ceil(dashCooldownTimer), 30, 147);
             } else {
                 g2.setColor(new Color(100, 255, 100));
                 g2.setFont(new Font("Dialog", Font.PLAIN, 14));
-                g2.drawString("Рывок: ГОТОВ (ПРОБЕЛ)", 30, 125);
+                g2.drawString("Рывок: ГОТОВ (ПРОБЕЛ)", 30, 147);
             }
         }
 
@@ -980,6 +1531,9 @@ public class DiabloidGame {
                 case DAMAGE_AURA: return new Color(180, 120, 255);
                 case CHAIN_LIGHTNING: return new Color(200, 220, 255);
                 case SAW_BLADE: return new Color(210, 210, 210);
+                case FROST_NOVA: return new Color(120, 220, 255);
+                case TOXIC_DART: return new Color(130, 220, 120);
+                case FLAME_ORB: return new Color(255, 150, 90);
                 default: return new Color(180, 180, 180);
             }
         }
@@ -993,6 +1547,9 @@ public class DiabloidGame {
                 case DAMAGE_AURA: return "АУ";
                 case CHAIN_LIGHTNING: return "ЦМ";
                 case SAW_BLADE: return "ПЛ";
+                case FROST_NOVA: return "ЛВ";
+                case TOXIC_DART: return "ЯД";
+                case FLAME_ORB: return "ОШ";
                 default: return "??";
             }
         }
@@ -1003,13 +1560,24 @@ public class DiabloidGame {
 
             g2.setColor(Color.WHITE);
             g2.setFont(new Font("Dialog", Font.BOLD, 58));
-            g2.drawString("JAVA SURVIVORS", 360, 220);
+            g2.drawString("JAVA SURVIVORS", 360, 180);
 
             g2.setFont(new Font("Dialog", Font.PLAIN, 24));
-            g2.drawString("WASD/СТРЕЛКИ - движение", 450, 320);
-            g2.drawString("ПРОБЕЛ - рывок (дэш)", 460, 355);
-            g2.drawString("Атака по ближайшему врагу автоматическая", 390, 390);
-            g2.drawString("ENTER - начать игру", 500, 420);
+            if (!characterSelectActive) {
+                g2.drawString((selectedMenuAction == 0 ? "> " : "  ") + "Новая игра", 500, 290);
+                g2.drawString((selectedMenuAction == 1 ? "> " : "  ") + "Загрузить сохранение", 500, 330);
+                g2.drawString("↑/↓ выбор, ENTER подтвердить", 430, 400);
+                g2.drawString("Банк монет: " + saveData.totalCoins, 500, 440);
+            } else {
+                g2.drawString("Выбор персонажа (1-0 или ENTER)", 410, 250);
+                for (int i = 0; i < characters.size(); i++) {
+                    CharacterDef c = characters.get(i);
+                    boolean unlocked = saveData.unlockedCharacters.contains(c.name);
+                    String line = (i == selectedCharacterIdx ? "> " : "  ") + (i + 1) + ". " + c.name +
+                            " [" + c.startWeapon + "] " + (unlocked ? "Открыт" : ("Цена: " + c.cost));
+                    g2.drawString(line, 280, 290 + i * 32);
+                }
+            }
         }
 
         private void drawGameOver(Graphics2D g2) {
@@ -1045,6 +1613,26 @@ public class DiabloidGame {
             }
         }
 
+        private void drawShopOverlay(Graphics2D g2) {
+            g2.setColor(new Color(0, 0, 0, 195));
+            g2.fillRect(0, 0, WIDTH, HEIGHT);
+            g2.setColor(new Color(255, 230, 170));
+            g2.setFont(new Font("Dialog", Font.BOLD, 40));
+            g2.drawString("МАГАЗИН МЕЖДУ ВОЛНАМИ", 320, 160);
+            g2.setFont(new Font("Dialog", Font.PLAIN, 24));
+            g2.setColor(Color.WHITE);
+            g2.drawString("Очки: " + score, 540, 205);
+            for (int i = 0; i < shopChoices.size(); i++) {
+                int y = 280 + i * 95;
+                g2.setColor(new Color(80, 62, 40, 220));
+                g2.fillRoundRect(300, y - 38, 690, 74, 12, 12);
+                g2.setColor(Color.WHITE);
+                g2.drawString((i + 1) + ". " + shopChoices.get(i), 330, y + 6);
+            }
+            g2.setFont(new Font("Dialog", Font.PLAIN, 20));
+            g2.drawString("Нажмите 1-3 для покупки, ESC чтобы пропустить", 350, 620);
+        }
+
         private static String formatTime(double seconds) {
             int s = (int) seconds;
             int min = s / 60;
@@ -1069,7 +1657,18 @@ public class DiabloidGame {
 
                 if (code == KeyEvent.VK_ENTER) {
                     if (gameState == GameState.MENU || gameState == GameState.GAME_OVER) {
-                        resetRun();
+                        handleMenuConfirm();
+                    }
+                }
+                if (gameState == GameState.MENU) {
+                    if (!characterSelectActive) {
+                        if (code == KeyEvent.VK_UP || code == KeyEvent.VK_W) selectedMenuAction = Math.max(0, selectedMenuAction - 1);
+                        if (code == KeyEvent.VK_DOWN || code == KeyEvent.VK_S) selectedMenuAction = Math.min(1, selectedMenuAction + 1);
+                    } else {
+                        if (code == KeyEvent.VK_UP || code == KeyEvent.VK_W) selectedCharacterIdx = Math.max(0, selectedCharacterIdx - 1);
+                        if (code == KeyEvent.VK_DOWN || code == KeyEvent.VK_S) selectedCharacterIdx = Math.min(characters.size() - 1, selectedCharacterIdx + 1);
+                        if (code >= KeyEvent.VK_1 && code <= KeyEvent.VK_9) selectedCharacterIdx = Math.min(characters.size() - 1, code - KeyEvent.VK_1);
+                        if (code == KeyEvent.VK_0) selectedCharacterIdx = 9;
                     }
                 }
 
@@ -1107,7 +1706,15 @@ public class DiabloidGame {
                     if (code == KeyEvent.VK_1) applyUpgrade(0);
                     if (code == KeyEvent.VK_2) applyUpgrade(1);
                     if (code == KeyEvent.VK_3) applyUpgrade(2);
-                    if (code == KeyEvent.VK_4) applyUpgrade(3);
+                }
+                if (upgradeState == UpgradeState.PAUSED_FOR_SHOP) {
+                    if (code == KeyEvent.VK_1) applyShopChoice(0);
+                    if (code == KeyEvent.VK_2) applyShopChoice(1);
+                    if (code == KeyEvent.VK_3) applyShopChoice(2);
+                    if (code == KeyEvent.VK_ESCAPE) {
+                        upgradeState = UpgradeState.NONE;
+                        shopChoices.clear();
+                    }
                 }
             }
 
@@ -1134,227 +1741,18 @@ public class DiabloidGame {
                         }
                     }
                 }
-            }
-        }
-    }
-
-    private enum GameState {
-        MENU, PLAYING, GAME_OVER
-    }
-
-    private enum UpgradeState {
-        NONE, PAUSED_FOR_UPGRADE
-    }
-
-    private enum WeaponType {
-        MAGIC_BOLT, TRIPLE_CAST, PULSE_RING, PIERCE_LANCE, DAMAGE_AURA, CHAIN_LIGHTNING, SAW_BLADE
-    }
-
-    // Классы для визуальных эффектов
-    private static class LightningEffect {
-        Enemy target, secondTarget, thirdTarget;
-        double life = 0.15;
-
-        LightningEffect(Enemy target) {
-            this.target = target;
-        }
-
-        LightningEffect(Enemy t1, Enemy t2, Enemy t3) {
-            this.target = t1;
-            this.secondTarget = t2;
-            this.thirdTarget = t3;
-        }
-    }
-
-    private static class SawBladeEffect {
-        double x, y, angle, speed, radius, damage;
-        int pierce;
-        double life = 1.8;
-
-        SawBladeEffect(double x, double y, double angle, double speed, double radius, double damage, int pierce) {
-            this.x = x;
-            this.y = y;
-            this.angle = angle;
-            this.speed = speed;
-            this.radius = radius;
-            this.damage = damage;
-            this.pierce = pierce;
-        }
-    }
-
-    private static final class Player {
-        private double x = 640;
-        private double y = 360;
-        private double radius = 16;
-
-        private double maxHp = 100;
-        private double hp = 100;
-        private double regen = 1.0;
-        private double armorReduction = 0.0;
-
-        private double moveSpeed = 240;
-        private double damageMultiplier = 1.0;
-        private double attackSpeedMultiplier = 1.0;
-        private double projectileSpeedMultiplier = 1.0;
-        private double projectileSizeMultiplier = 1.0;
-        private double magnetRadius = 105;
-        private double shotCooldown = 0.2;
-        private double tripleCooldown = 0.8;
-        private double pulseCooldown = 1.2;
-        private double lanceCooldown = 0.6;
-        private double lightningCooldown = 1.1;
-        private double sawCooldown = 0.7;
-        private double auraTickCooldown = 0.2;
-        private double auraRadius = 82;
-        private double flatDamageBonus = 0.0;
-        private double multishotMultiplier = 0.0; // Изначально 0 (один снаряд)
-
-        private int level = 1;
-        private int xp = 0;
-        private int xpToNext = 24;
-
-        private void reset() {
-            x = 640;
-            y = 360;
-            maxHp = 150;
-            hp = 150;
-            regen = 2.5;
-            armorReduction = 0.05;
-            moveSpeed = 240;
-            damageMultiplier = 1.0;
-            attackSpeedMultiplier = 1.0;
-            projectileSpeedMultiplier = 1.0;
-            projectileSizeMultiplier = 1.0;
-            magnetRadius = 105;
-            shotCooldown = 0.2;
-            tripleCooldown = 0.8;
-            pulseCooldown = 1.2;
-            lanceCooldown = 0.6;
-            lightningCooldown = 1.1;
-            sawCooldown = 0.7;
-            auraTickCooldown = 0.2;
-            auraRadius = 82;
-            flatDamageBonus = 0.0;
-            multishotMultiplier = 0.0; // Сброс до 0
-            level = 1;
-            xp = 0;
-            xpToNext = 8;
-        }
-
-        private void heal(double dt) {
-            hp = Math.min(maxHp, hp + regen * dt);
-        }
-
-        private void updateMovement(double dt, boolean up, boolean down, boolean left, boolean right, int maxX, int maxY) {
-            double dx = 0;
-            double dy = 0;
-            if (up) dy -= 1;
-            if (down) dy += 1;
-            if (left) dx -= 1;
-            if (right) dx += 1;
-
-            if (dx != 0 || dy != 0) {
-                double len = Math.hypot(dx, dy);
-                x += (dx / len) * moveSpeed * dt;
-                y += (dy / len) * moveSpeed * dt;
-                x = Math.max(radius, Math.min(maxX - radius, x));
-                y = Math.max(radius, Math.min(maxY - radius, y));
-            }
-        }
-    }
-
-    private static final class Enemy {
-        private double x;
-        private double y;
-        private final double radius;
-        private double hp;
-        private final double speed;
-        private final double contactDamage;
-        private final int xpValue;
-        private final int score;
-        private double hitFlashTimer = 0;
-        private double sizeScale = 1.0;
-
-
-        private Enemy(double x, double y, double radius, double hp, double speed, double contactDamage, int xpValue) {
-            this.x = x;
-            this.y = y;
-            this.radius = radius;
-            this.hp = hp;
-            this.speed = speed;
-            this.contactDamage = contactDamage;
-            this.xpValue = xpValue;
-            this.score = xpValue * 3;
-        }
-
-        void takeDamage(double damage) {
-            this.hp -= damage;
-
-            this.hitFlashTimer = 0.15;
-            this.sizeScale = 1.25;
-        }
-
-        void updateAnimation(double dt) {
-            if (hitFlashTimer > 0) {
-                hitFlashTimer -= dt;
-                if (sizeScale > 1.0) {
-                    sizeScale -= dt * 5.0;
-                    if (sizeScale < 1.0) sizeScale = 1.0;
+                if (upgradeState == UpgradeState.PAUSED_FOR_SHOP) {
+                    int mouseY = e.getY();
+                    for (int i = 0; i < shopChoices.size(); i++) {
+                        int y = 280 + i * 95;
+                        if (mouseY >= y - 38 && mouseY <= y + 36) {
+                            applyShopChoice(i);
+                            break;
+                        }
+                    }
                 }
-            } else {
-                sizeScale = 1.0;
             }
         }
-
-        double getCurrentRadius() {
-            return radius * sizeScale;
-        }
     }
 
-    private static final class Projectile {
-        private double x;
-        private double y;
-        private final double vx;
-        private final double vy;
-        private final double damage;
-        private final double radius;
-        private int pierce;
-        private double life = 1.8;
-
-        private Projectile(double x, double y, double vx, double vy, double damage, double radius, int pierce) {
-            this.x = x;
-            this.y = y;
-            this.vx = vx;
-            this.vy = vy;
-            this.damage = damage;
-            this.radius = radius;
-            this.pierce = pierce;
-        }
-    }
-
-    private static final class XpOrb {
-        private double x;
-        private double y;
-        private final int value;
-
-        private XpOrb(double x, double y, int value) {
-            this.x = x;
-            this.y = y;
-            this.value = value;
-        }
-    }
-
-    private static final class DamageNumber {
-        double x;
-        double y;
-        int value;
-        double alpha;
-
-        DamageNumber(double x, double y, int value) {
-            this.x = x;
-            this.y = y;
-            this.value = value;
-            this.alpha = 1.0;
-        }
-    }
 }
