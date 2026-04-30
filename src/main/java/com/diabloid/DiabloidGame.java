@@ -1,16 +1,16 @@
 package com.diabloid;
 
+import javax.imageio.ImageIO;
 import javax.swing.JFrame;
 import javax.swing.JPanel;
 import javax.swing.SwingUtilities;
-import java.awt.Color;
-import java.awt.Dimension;
-import java.awt.Font;
-import java.awt.Graphics;
-import java.awt.Graphics2D;
-import java.awt.RenderingHints;
+import java.awt.*;
+import java.awt.image.BufferedImage;
+import java.io.IOException;
 import java.awt.event.KeyAdapter;
 import java.awt.event.KeyEvent;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
 import java.awt.geom.Ellipse2D;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -23,7 +23,7 @@ import java.util.Set;
 public class DiabloidGame {
     public static void main(String[] args) {
         SwingUtilities.invokeLater(() -> {
-            JFrame frame = new JFrame("Русские Выживанцы");
+            JFrame frame = new JFrame("Java Survivors");
             frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
             frame.setResizable(false);
             frame.setContentPane(new GamePanel());
@@ -34,9 +34,17 @@ public class DiabloidGame {
     }
 
     private static final class GamePanel extends JPanel implements Runnable {
+        private static Image playerSprite;
+        private static Image enemyNormalSprite;
+        private static Image enemyTankSprite;
+        private static Image bgSprite;
+        private static boolean imagesLoaded = false;
         private static final int WIDTH = 1280;
         private static final int HEIGHT = 720;
         private static final double CONTACT_DAMAGE_TICK = 0.25;
+        private static final double DASH_SPEED_MULTIPLIER = 4.5;
+        private static final double DASH_DURATION = 0.15;
+        private static final double DASH_COOLDOWN = 1.5;
 
         private final Random rng = new Random();
         private final Thread gameThread;
@@ -46,16 +54,27 @@ public class DiabloidGame {
         private boolean left;
         private boolean right;
 
+        private boolean isDashing = false;
+        private double dashTimer = 0;
+        private double dashCooldownTimer = 0;
+        private double lastDashX = 640;
+        private double lastDashY = 360;
+
         private boolean running = true;
-        private GameState gameState = GameState.MENU;
-        private UpgradeState upgradeState = UpgradeState.NONE;
+        GameState gameState = GameState.MENU;
+        UpgradeState upgradeState = UpgradeState.NONE;
 
         private final Player player = new Player();
         private final List<Enemy> enemies = new ArrayList<>();
         private final List<Projectile> projectiles = new ArrayList<>();
         private final List<XpOrb> xpOrbs = new ArrayList<>();
+        private final List<DamageNumber> damageNumbers = new ArrayList<>();
         private final List<String> upgradeChoices = new ArrayList<>();
         private final Set<WeaponType> unlockedWeapons = new HashSet<>();
+
+        // Специальные эффекты для отрисовки
+        private final List<LightningEffect> chainLightnings = new ArrayList<>();
+        private final List<SawBladeEffect> sawBlades = new ArrayList<>();
 
         private double worldTime;
         private double spawnTimer;
@@ -64,20 +83,49 @@ public class DiabloidGame {
         private int pendingLevelUps;
 
         private final String[] statUpgrades = {
-            "Сила +20%", "Скорость атаки +20%", "Скорость движения +15%",
-            "Макс. HP +20", "Регенерация +0.5", "Магнит +20%",
-            "Броня +8%", "Скорость снаряда +20%", "Размер снаряда +20%",
-            "Урон +5"
+                "Сила +20%", "Скорость атаки +20%", "Скорость движения +15%",
+                "Макс. HP +20", "Регенерация +0.5", "Магнит +20%",
+                "Броня +8%", "Скорость снаряда +20%", "Размер снаряда +20%",
+                "Урон +5", "Кол-во снарядов +1"
         };
 
         private GamePanel() {
+            loadAssets();
             setPreferredSize(new Dimension(WIDTH, HEIGHT));
             setFocusable(true);
             setBackground(new Color(17, 17, 20));
             addKeyListener(new KeyHandler());
 
+            addMouseListener(new MouseHandler());
+            addMouseMotionListener(new MouseHandler());
+
             gameThread = new Thread(this, "game-loop");
             gameThread.start();
+        }
+
+        private void loadAssets() {
+            if (imagesLoaded) return;
+
+            Toolkit toolkit = Toolkit.getDefaultToolkit();
+
+            try {
+                playerSprite = toolkit.getImage("assets/player.png");
+                enemyNormalSprite = toolkit.getImage("assets/enemy_normal.png");
+                enemyTankSprite = toolkit.getImage("assets/enemy_tank.png");
+                bgSprite = toolkit.getImage("assets/background.jpg");
+
+                MediaTracker tracker = new MediaTracker(new JPanel());
+                tracker.addImage(playerSprite, 0);
+                tracker.addImage(enemyNormalSprite, 1);
+                tracker.addImage(enemyTankSprite, 2);
+                tracker.addImage(bgSprite, 3);
+                tracker.waitForAll();
+
+                imagesLoaded = true;
+            } catch (Exception e) {
+                System.err.println("Ошибка загрузки спрайтов: " + e.getMessage());
+                imagesLoaded = false;
+            }
         }
 
         @Override
@@ -107,13 +155,31 @@ public class DiabloidGame {
             }
 
             worldTime += dt;
+
+            if (isDashing) {
+                dashTimer -= dt;
+                if (dashTimer <= 0) {
+                    isDashing = false;
+                    lastDashX = player.x;
+                    lastDashY = player.y;
+                }
+            } else {
+                dashCooldownTimer -= dt;
+            }
+
             player.heal(dt);
             player.updateMovement(dt, up, down, left, right, WIDTH, HEIGHT);
+
+            // Обновление активных эффектов
+            updateChainLightning(dt);
+            updateSawBlades(dt);
+
             updateWeapons(dt);
             spawnEnemies(dt);
             updateEnemies(dt);
             updateProjectiles(dt);
             updateXpOrbs(dt);
+            updateDamageNumbers(dt);
         }
 
         private void updateWeapons(double dt) {
@@ -170,36 +236,85 @@ public class DiabloidGame {
         private void shootMagicBolt() {
             Enemy target = findNearestEnemy();
             if (target == null) return;
-            spawnProjectileTowards(target, 18.0, 6.0, 600.0, 0);
+
+            // Логика: 1 базовый снаряд + бонус от multishot
+            // multishotMultiplier по умолчанию 0.0, значит выстрел один.
+            // Если выбрано улучшение (+1), то totalShots = 2.
+            int baseCount = 1;
+            int totalShots = (int) Math.round(baseCount + player.multishotMultiplier);
+
+            // Если multishot > 0, делаем веерный выстрел, иначе один прямой
+            if (totalShots > 1) {
+                double dx = target.x - player.x;
+                double dy = target.y - player.y;
+                double len = Math.hypot(dx, dy);
+                if (len < 0.001) return;
+
+                double baseAngle = Math.atan2(dy, dx);
+                double totalSpread = 0.3; // Угол разброса
+                double angleStep = totalSpread / (totalShots - 1);
+
+                for (int i = 0; i < totalShots; i++) {
+                    double offset = (i - (totalShots - 1) / 2.0) * angleStep;
+                    double angle = baseAngle + offset;
+
+                    double speed = 600.0 * player.projectileSpeedMultiplier;
+                    double vx = Math.cos(angle) * speed;
+                    double vy = Math.sin(angle) * speed;
+
+                    double radius = 6.0 * player.projectileSizeMultiplier;
+                    double damage = (18.0 * player.damageMultiplier) + player.flatDamageBonus;
+
+                    projectiles.add(new Projectile(player.x, player.y, vx, vy, damage, radius, 0));
+                }
+            } else {
+                spawnProjectileTowards(target, 18.0, 6.0, 600.0, 0);
+            }
         }
 
         private void shootTripleCast() {
             Enemy target = findNearestEnemy();
             if (target == null) return;
+
             double dx = target.x - player.x;
             double dy = target.y - player.y;
             double baseAngle = Math.atan2(dy, dx);
-            double[] spread = {-0.22, 0, 0.22};
-            for (double offset : spread) {
+
+            int baseCount = 3;
+            int totalShots = (int) Math.round(baseCount + player.multishotMultiplier);
+
+            double totalSpread = 0.44;
+            double angleStep = totalSpread / (totalShots - 1);
+
+            for (int i = 0; i < totalShots; i++) {
+                double offset = (i - (totalShots - 1) / 2.0) * angleStep;
                 double angle = baseAngle + offset;
+
                 double speed = 540.0 * player.projectileSpeedMultiplier;
                 double vx = Math.cos(angle) * speed;
                 double vy = Math.sin(angle) * speed;
+
                 double radius = 5.5 * player.projectileSizeMultiplier;
                 double damage = (12.0 * player.damageMultiplier) + player.flatDamageBonus;
+
                 projectiles.add(new Projectile(player.x, player.y, vx, vy, damage, radius, 0));
             }
         }
 
         private void shootPulseRing() {
-            int count = 10;
-            for (int i = 0; i < count; i++) {
-                double angle = (Math.PI * 2.0 / count) * i;
+            int baseCount = 10;
+            int totalCount = (int) Math.round(baseCount + player.multishotMultiplier);
+
+            for (int i = 0; i < totalCount; i++) {
+                double angle = (Math.PI * 2.0 / totalCount) * i;
+
                 double speed = 430.0 * player.projectileSpeedMultiplier;
                 double vx = Math.cos(angle) * speed;
                 double vy = Math.sin(angle) * speed;
+
                 double radius = 5.0 * player.projectileSizeMultiplier;
                 double damage = (14.0 * player.damageMultiplier) + player.flatDamageBonus;
+
                 projectiles.add(new Projectile(player.x, player.y, vx, vy, damage, radius, 0));
             }
         }
@@ -207,7 +322,34 @@ public class DiabloidGame {
         private void shootPierceLance() {
             Enemy target = findNearestEnemy();
             if (target == null) return;
-            spawnProjectileTowards(target, 24.0, 7.0, 760.0, 2);
+
+            // Пращающее копье теперь тоже может быть множественным
+            int baseCount = 1;
+            int totalShots = (int) Math.round(baseCount + player.multishotMultiplier);
+
+            double dx = target.x - player.x;
+            double dy = target.y - player.y;
+            double len = Math.hypot(dx, dy);
+            if (len < 0.001) return;
+
+            double baseAngle = Math.atan2(dy, dx);
+            double totalSpread = 0.2;
+            double angleStep = totalSpread / Math.max(1, totalShots - 1);
+
+            for (int i = 0; i < totalShots; i++) {
+                double offset = (i - (totalShots - 1) / 2.0) * angleStep;
+                double angle = baseAngle + offset;
+
+                double speed = 760.0 * player.projectileSpeedMultiplier;
+                double vx = Math.cos(angle) * speed;
+                double vy = Math.sin(angle) * speed;
+
+                double radius = 7.0 * player.projectileSizeMultiplier;
+                double damage = (24.0 * player.damageMultiplier) + player.flatDamageBonus;
+
+                // Копья имеют pierce
+                projectiles.add(new Projectile(player.x, player.y, vx, vy, damage, radius, 2));
+            }
         }
 
         private void updateDamageAura(double dt) {
@@ -228,6 +370,7 @@ public class DiabloidGame {
         private void castChainLightning() {
             Enemy first = findNearestEnemy();
             if (first == null) return;
+
             Enemy second = null;
             Enemy third = null;
             double chainRangeSq = 210 * 210;
@@ -247,22 +390,98 @@ public class DiabloidGame {
                     }
                 }
             }
+
+            // Создаем эффект молнии для отрисовки с передачей всех целей
+            chainLightnings.add(new LightningEffect(first, second, third));
+
             double baseDamage = (26.0 * player.damageMultiplier) + player.flatDamageBonus;
             damageEnemy(first, baseDamage);
             if (second != null) damageEnemy(second, baseDamage * 0.72);
             if (third != null) damageEnemy(third, baseDamage * 0.5);
         }
 
+        private void updateChainLightning(double dt) {
+            Iterator<LightningEffect> it = chainLightnings.iterator();
+            while (it.hasNext()) {
+                LightningEffect le = it.next();
+                le.life -= dt;
+                if (le.life <= 0) {
+                    it.remove();
+                }
+            }
+        }
+
         private void shootSawBlade() {
             Enemy target = findNearestEnemy();
             if (target == null) return;
-            spawnProjectileTowards(target, 20.0, 8.0, 500.0, 5);
+
+            double dx = target.x - player.x;
+            double dy = target.y - player.y;
+            double baseAngle = Math.atan2(dy, dx);
+
+            int baseCount = 1;
+            int totalShots = (int) Math.round(baseCount + player.multishotMultiplier);
+
+            double totalSpread = 0.5;
+            double angleStep = totalSpread / Math.max(1, totalShots - 1);
+
+            for (int i = 0; i < totalShots; i++) {
+                double offset = (i - (totalShots - 1) / 2.0) * angleStep;
+                double angle = baseAngle + offset;
+
+                double speed = 500.0 * player.projectileSpeedMultiplier;
+                double vx = Math.cos(angle) * speed;
+                double vy = Math.sin(angle) * speed;
+
+                double radius = 8.0 * player.projectileSizeMultiplier;
+                double damage = (20.0 * player.damageMultiplier) + player.flatDamageBonus;
+
+                // Добавляем эффект пилы для отрисовки
+                sawBlades.add(new SawBladeEffect(player.x, player.y, angle, speed, radius, damage, 5));
+            }
+        }
+
+        private void updateSawBlades(double dt) {
+            // Используем обратный цикл или копию, чтобы избежать ConcurrentModificationException
+            // при удалении врагов внутри цикла.
+            // Но так как мы удаляем из 'enemies', а итерируемся по 'sawBlades', проблема возникает,
+            // если мы пытаемся изменить структуру 'sawBlades' или если 'damageEnemy' вызывает удаление из 'enemies',
+            // которое конфликтует с внутренними механизмами Java Collections при одновременной итерации.
+            // Здесь safest way - скопировать список врагов перед проверкой.
+
+            List<Enemy> currentEnemies = new ArrayList<>(enemies);
+
+            Iterator<SawBladeEffect> it = sawBlades.iterator();
+            while (it.hasNext()) {
+                SawBladeEffect sb = it.next();
+                sb.life -= dt;
+                sb.angle += dt * 15.0; // Вращение
+
+                // Движение вперед
+                double moveVx = Math.cos(sb.angle) * sb.speed;
+                double moveVy = Math.sin(sb.angle) * sb.speed;
+                sb.x += moveVx * dt;
+                sb.y += moveVy * dt;
+
+                // Проверка столкновений для пилы (по копии списка врагов)
+                for (Enemy e : currentEnemies) {
+                    if (e.hp <= 0) continue; // Пропускаем мертвых
+                    if (distanceSq(sb.x, sb.y, e.x, e.y) <= (sb.radius + e.radius) * (sb.radius + e.radius)) {
+                        damageEnemy(e, sb.damage);
+                        sb.pierce--;
+                    }
+                }
+
+                if (sb.life <= 0 || sb.pierce <= 0 || sb.x < -100 || sb.y < -100 || sb.x > WIDTH + 100 || sb.y > HEIGHT + 100) {
+                    it.remove();
+                }
+            }
         }
 
         private Enemy findNearestEnemy() {
             return enemies.stream()
-                .min(Comparator.comparingDouble(e -> distanceSq(player.x, player.y, e.x, e.y)))
-                .orElse(null);
+                    .min(Comparator.comparingDouble(e -> distanceSq(player.x, player.y, e.x, e.y)))
+                    .orElse(null);
         }
 
         private void spawnProjectileTowards(Enemy target, double baseDamage, double baseRadius, double baseSpeed, int pierce) {
@@ -313,9 +532,9 @@ public class DiabloidGame {
             }
 
             if (tank) {
-                return new Enemy(x, y, 22, 95 * difficulty, 62 + difficulty * 5, 10 + difficulty * 2, 4 + (int) difficulty);
+                return new Enemy(x, y, 22, 95 * difficulty, 62 + difficulty * 5, 5 + difficulty * 2, 4 + (int) difficulty);
             }
-            return new Enemy(x, y, 14, 40 * difficulty, 105 + difficulty * 8, 6 + difficulty, 2 + (int) (difficulty * 0.8));
+            return new Enemy(x, y, 14, 40 * difficulty, 105 + difficulty * 8, 3 + difficulty, 2 + (int) (difficulty * 0.8));
         }
 
         private void updateEnemies(double dt) {
@@ -327,13 +546,14 @@ public class DiabloidGame {
                     e.x += (dx / len) * e.speed * dt;
                     e.y += (dy / len) * e.speed * dt;
                 }
+                e.updateAnimation(dt);
             }
 
             contactDamageTimer -= dt;
             if (contactDamageTimer <= 0) {
                 double sumDamage = 0;
                 for (Enemy e : enemies) {
-                    if (distanceSq(e.x, e.y, player.x, player.y) <= (e.radius + player.radius) * (e.radius + player.radius)) {
+                    if (!isDashing && distanceSq(e.x, e.y, player.x, player.y) <= (e.radius + player.radius) * (e.radius + player.radius)) {
                         sumDamage += e.contactDamage;
                     }
                 }
@@ -381,7 +601,9 @@ public class DiabloidGame {
         }
 
         private void damageEnemy(Enemy enemy, double damage) {
-            enemy.hp -= damage;
+            enemy.takeDamage(damage);
+            damageNumbers.add(new DamageNumber(enemy.x, enemy.y - enemy.radius, (int) damage));
+
             if (enemy.hp <= 0) {
                 enemies.remove(enemy);
                 score += enemy.score;
@@ -411,13 +633,26 @@ public class DiabloidGame {
                     while (player.xp >= player.xpToNext) {
                         player.xp -= player.xpToNext;
                         player.level++;
-                        player.xpToNext = (int) Math.round(player.xpToNext * 1.26 + 8);
+                        player.xpToNext = (int) Math.round(player.xpToNext * 1.15 + 2);
                         pendingLevelUps++;
                     }
                     if (pendingLevelUps > 0 && upgradeState == UpgradeState.NONE) {
                         rollUpgradeChoices();
                         upgradeState = UpgradeState.PAUSED_FOR_UPGRADE;
                     }
+                }
+            }
+        }
+
+        private void updateDamageNumbers(double dt) {
+            Iterator<DamageNumber> di = damageNumbers.iterator();
+            while (di.hasNext()) {
+                DamageNumber dn = di.next();
+                dn.y -= 15.0 * dt;
+                dn.alpha -= 2.0 * dt;
+
+                if (dn.alpha <= 0) {
+                    di.remove();
                 }
             }
         }
@@ -478,6 +713,8 @@ public class DiabloidGame {
                 player.projectileSizeMultiplier *= 1.20;
             } else if (picked.startsWith("Урон +5")) {
                 player.flatDamageBonus += 5.0;
+            } else if (picked.startsWith("Кол-во снарядов")) {
+                player.multishotMultiplier += 1.0;
             } else if (picked.contains("Тройной залп")) {
                 unlockedWeapons.add(WeaponType.TRIPLE_CAST);
             } else if (picked.contains("Кольцо импульса")) {
@@ -505,9 +742,12 @@ public class DiabloidGame {
             enemies.clear();
             projectiles.clear();
             xpOrbs.clear();
+            damageNumbers.clear();
             upgradeChoices.clear();
             unlockedWeapons.clear();
             unlockedWeapons.add(WeaponType.MAGIC_BOLT);
+            chainLightnings.clear();
+            sawBlades.clear();
 
             player.reset();
             worldTime = 0;
@@ -515,6 +755,8 @@ public class DiabloidGame {
             contactDamageTimer = 0;
             score = 0;
             pendingLevelUps = 0;
+            isDashing = false;
+            dashCooldownTimer = 0;
             gameState = GameState.PLAYING;
             upgradeState = UpgradeState.NONE;
         }
@@ -539,17 +781,55 @@ public class DiabloidGame {
         }
 
         private void drawBackground(Graphics2D g2) {
-            g2.setColor(new Color(27, 27, 31));
-            for (int x = 0; x < WIDTH; x += 64) {
-                for (int y = 0; y < HEIGHT; y += 64) {
-                    int pulse = (int) ((Math.sin((x + y + worldTime * 45) * 0.03) + 1) * 8);
-                    g2.setColor(new Color(26 + pulse, 26 + pulse, 32 + pulse));
-                    g2.fillRect(x, y, 62, 62);
+            if (bgSprite != null && imagesLoaded) {
+                g2.drawImage(bgSprite, 0, 0, WIDTH, HEIGHT, this);
+            } else {
+                g2.setColor(new Color(27, 27, 31));
+                for (int x = 0; x < WIDTH; x += 64) {
+                    for (int y = 0; y < HEIGHT; y += 64) {
+                        int pulse = (int) ((Math.sin((x + y + worldTime * 45) * 0.03) + 1) * 8);
+                        g2.setColor(new Color(26 + pulse, 26 + pulse, 32 + pulse));
+                        g2.fillRect(x, y, 62, 62);
+                    }
                 }
             }
         }
 
         private void drawGame(Graphics2D g2) {
+            if (isDashing) {
+                g2.setColor(new Color(100, 200, 255, 100));
+                g2.fill(new Ellipse2D.Double(player.x - player.radius * 2, player.y - player.radius * 2,
+                        player.radius * 4, player.radius * 4));
+            }
+
+            // Отрисовка цепной молнии
+            for (LightningEffect le : chainLightnings) {
+                g2.setColor(new Color(200, 220, 255, 200));
+                g2.setStroke(new BasicStroke(4));
+                g2.drawLine((int)player.x, (int)player.y, (int)le.target.x, (int)le.target.y);
+
+                if (le.secondTarget != null) {
+                    g2.drawLine((int)le.target.x, (int)le.target.y, (int)le.secondTarget.x, (int)le.secondTarget.y);
+                }
+                if (le.thirdTarget != null) {
+                    g2.drawLine((int)le.secondTarget.x, (int)le.secondTarget.y, (int)le.thirdTarget.x, (int)le.thirdTarget.y);
+                }
+            }
+
+            // Отрисовка пил
+            for (SawBladeEffect sb : sawBlades) {
+                g2.setColor(new Color(210, 210, 210));
+                g2.setStroke(new BasicStroke(2));
+                g2.draw(new Ellipse2D.Double(sb.x - sb.radius, sb.y - sb.radius, sb.radius * 2, sb.radius * 2));
+
+                // Линия вращения
+                g2.setColor(new Color(210, 210, 210, 100));
+                g2.setStroke(new BasicStroke(1));
+                double endX = sb.x + Math.cos(sb.angle) * (sb.radius + 5);
+                double endY = sb.y + Math.sin(sb.angle) * (sb.radius + 5);
+                g2.drawLine((int)sb.x, (int)sb.y, (int)endX, (int)endY);
+            }
+
             for (XpOrb orb : xpOrbs) {
                 g2.setColor(new Color(80, 180, 255));
                 g2.fill(new Ellipse2D.Double(orb.x - 4, orb.y - 4, 8, 8));
@@ -561,8 +841,53 @@ public class DiabloidGame {
             }
 
             for (Enemy e : enemies) {
-                g2.setColor(e.radius > 18 ? new Color(155, 52, 52) : new Color(190, 75, 75));
-                g2.fill(new Ellipse2D.Double(e.x - e.radius, e.y - e.radius, e.radius * 2, e.radius * 2));
+                Image spriteToDraw = null;
+                boolean isTank = e.radius > 18;
+
+                if (isTank) {
+                    spriteToDraw = enemyTankSprite;
+                } else {
+                    spriteToDraw = enemyNormalSprite;
+                }
+
+                double currentRadius = e.getCurrentRadius();
+
+                if (spriteToDraw != null && imagesLoaded) {
+                    int w = spriteToDraw.getWidth(this);
+                    int h = spriteToDraw.getHeight(this);
+
+                    if (e.hitFlashTimer > 0) {
+                        g2.setComposite(java.awt.AlphaComposite.getInstance(java.awt.AlphaComposite.SRC_OVER, 0.6f));
+                        g2.drawImage(spriteToDraw,
+                                (int)(e.x - w / 2.0),
+                                (int)(e.y - h / 2.0),
+                                w, h, this);
+                        g2.setComposite(java.awt.AlphaComposite.SrcOver);
+                    } else {
+                        g2.drawImage(spriteToDraw,
+                                (int)(e.x - w / 2.0),
+                                (int)(e.y - h / 2.0),
+                                w, h, this);
+                    }
+                } else {
+                    if (e.hitFlashTimer > 0) {
+                        g2.setColor(new Color(255, 255, 255, 200));
+                        g2.fill(new Ellipse2D.Double(
+                                e.x - currentRadius,
+                                e.y - currentRadius,
+                                currentRadius * 2,
+                                currentRadius * 2
+                        ));
+                    } else {
+                        g2.setColor(isTank ? new Color(155, 52, 52) : new Color(190, 75, 75));
+                        g2.fill(new Ellipse2D.Double(
+                                e.x - currentRadius,
+                                e.y - currentRadius,
+                                currentRadius * 2,
+                                currentRadius * 2
+                        ));
+                    }
+                }
             }
 
             if (unlockedWeapons.contains(WeaponType.DAMAGE_AURA)) {
@@ -571,8 +896,24 @@ public class DiabloidGame {
                 g2.fill(new Ellipse2D.Double(player.x - aura, player.y - aura, aura * 2, aura * 2));
             }
 
-            g2.setColor(new Color(80, 230, 120));
-            g2.fill(new Ellipse2D.Double(player.x - player.radius, player.y - player.radius, player.radius * 2, player.radius * 2));
+            if (playerSprite != null && imagesLoaded) {
+                int w = playerSprite.getWidth(this);
+                int h = playerSprite.getHeight(this);
+                g2.drawImage(playerSprite,
+                        (int)(player.x - w / 2.0),
+                        (int)(player.y - h / 2.0),
+                        w, h, this);
+            } else {
+                g2.setColor(new Color(80, 230, 120));
+                g2.fill(new Ellipse2D.Double(player.x - player.radius, player.y - player.radius,
+                        player.radius * 2, player.radius * 2));
+            }
+
+            for (DamageNumber dn : damageNumbers) {
+                g2.setColor(new Color(255, 255, 255, (int)(dn.alpha * 255)));
+                g2.setFont(new Font("Dialog", Font.BOLD, 16));
+                g2.drawString(Integer.toString(dn.value), (int)dn.x - 5, (int)dn.y);
+            }
         }
 
         private void drawHud(Graphics2D g2) {
@@ -602,6 +943,16 @@ public class DiabloidGame {
             g2.fillRoundRect(145, 90, xpFill, 12, 8, 8);
 
             drawWeaponIcons(g2);
+
+            if (dashCooldownTimer > 0) {
+                g2.setColor(new Color(100, 100, 100));
+                g2.setFont(new Font("Dialog", Font.PLAIN, 14));
+                g2.drawString("Рывок: " + (int)Math.ceil(dashCooldownTimer), 30, 125);
+            } else {
+                g2.setColor(new Color(100, 255, 100));
+                g2.setFont(new Font("Dialog", Font.PLAIN, 14));
+                g2.drawString("Рывок: ГОТОВ (ПРОБЕЛ)", 30, 125);
+            }
         }
 
         private void drawWeaponIcons(Graphics2D g2) {
@@ -652,11 +1003,12 @@ public class DiabloidGame {
 
             g2.setColor(Color.WHITE);
             g2.setFont(new Font("Dialog", Font.BOLD, 58));
-            g2.drawString("РУССКИЕ ВЫЖИВАНЦЫ", 300, 220);
+            g2.drawString("JAVA SURVIVORS", 360, 220);
 
             g2.setFont(new Font("Dialog", Font.PLAIN, 24));
             g2.drawString("WASD/СТРЕЛКИ - движение", 450, 320);
-            g2.drawString("Атака по ближайшему врагу автоматическая", 390, 355);
+            g2.drawString("ПРОБЕЛ - рывок (дэш)", 460, 355);
+            g2.drawString("Атака по ближайшему врагу автоматическая", 390, 390);
             g2.drawString("ENTER - начать игру", 500, 420);
         }
 
@@ -721,6 +1073,36 @@ public class DiabloidGame {
                     }
                 }
 
+                if (code == KeyEvent.VK_SPACE && !isDashing && dashCooldownTimer <= 0) {
+                    isDashing = true;
+                    dashTimer = DASH_DURATION;
+                    dashCooldownTimer = DASH_COOLDOWN;
+
+                    double dx = 0;
+                    double dy = 0;
+                    if (up) dy -= 1;
+                    if (down) dy += 1;
+                    if (left) dx -= 1;
+                    if (right) dx += 1;
+
+                    if (dx == 0 && dy == 0) {
+                        dx = 0;
+                        dy = -1;
+                    }
+
+                    double len = Math.hypot(dx, dy);
+                    if (len > 0) {
+                        double dashVx = (dx / len) * player.moveSpeed * DASH_SPEED_MULTIPLIER;
+                        double dashVy = (dy / len) * player.moveSpeed * DASH_SPEED_MULTIPLIER;
+
+                        player.x += dashVx * DASH_DURATION;
+                        player.y += dashVy * DASH_DURATION;
+
+                        player.x = Math.max(player.radius, Math.min(WIDTH - player.radius, player.x));
+                        player.y = Math.max(player.radius, Math.min(HEIGHT - player.radius, player.y));
+                    }
+                }
+
                 if (upgradeState == UpgradeState.PAUSED_FOR_UPGRADE) {
                     if (code == KeyEvent.VK_1) applyUpgrade(0);
                     if (code == KeyEvent.VK_2) applyUpgrade(1);
@@ -738,6 +1120,22 @@ public class DiabloidGame {
                 if (code == KeyEvent.VK_D || code == KeyEvent.VK_RIGHT) right = false;
             }
         }
+
+        private class MouseHandler extends MouseAdapter {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (upgradeState == UpgradeState.PAUSED_FOR_UPGRADE) {
+                    int mouseY = e.getY();
+                    for (int i = 0; i < upgradeChoices.size(); i++) {
+                        int y = 230 + i * 105;
+                        if (mouseY >= y - 42 && mouseY <= y + 42) {
+                            applyUpgrade(i);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private enum GameState {
@@ -750,6 +1148,38 @@ public class DiabloidGame {
 
     private enum WeaponType {
         MAGIC_BOLT, TRIPLE_CAST, PULSE_RING, PIERCE_LANCE, DAMAGE_AURA, CHAIN_LIGHTNING, SAW_BLADE
+    }
+
+    // Классы для визуальных эффектов
+    private static class LightningEffect {
+        Enemy target, secondTarget, thirdTarget;
+        double life = 0.15;
+
+        LightningEffect(Enemy target) {
+            this.target = target;
+        }
+
+        LightningEffect(Enemy t1, Enemy t2, Enemy t3) {
+            this.target = t1;
+            this.secondTarget = t2;
+            this.thirdTarget = t3;
+        }
+    }
+
+    private static class SawBladeEffect {
+        double x, y, angle, speed, radius, damage;
+        int pierce;
+        double life = 1.8;
+
+        SawBladeEffect(double x, double y, double angle, double speed, double radius, double damage, int pierce) {
+            this.x = x;
+            this.y = y;
+            this.angle = angle;
+            this.speed = speed;
+            this.radius = radius;
+            this.damage = damage;
+            this.pierce = pierce;
+        }
     }
 
     private static final class Player {
@@ -777,6 +1207,7 @@ public class DiabloidGame {
         private double auraTickCooldown = 0.2;
         private double auraRadius = 82;
         private double flatDamageBonus = 0.0;
+        private double multishotMultiplier = 0.0; // Изначально 0 (один снаряд)
 
         private int level = 1;
         private int xp = 0;
@@ -785,10 +1216,10 @@ public class DiabloidGame {
         private void reset() {
             x = 640;
             y = 360;
-            maxHp = 100;
-            hp = 100;
-            regen = 1.0;
-            armorReduction = 0;
+            maxHp = 150;
+            hp = 150;
+            regen = 2.5;
+            armorReduction = 0.05;
             moveSpeed = 240;
             damageMultiplier = 1.0;
             attackSpeedMultiplier = 1.0;
@@ -804,9 +1235,10 @@ public class DiabloidGame {
             auraTickCooldown = 0.2;
             auraRadius = 82;
             flatDamageBonus = 0.0;
+            multishotMultiplier = 0.0; // Сброс до 0
             level = 1;
             xp = 0;
-            xpToNext = 24;
+            xpToNext = 8;
         }
 
         private void heal(double dt) {
@@ -840,6 +1272,9 @@ public class DiabloidGame {
         private final double contactDamage;
         private final int xpValue;
         private final int score;
+        private double hitFlashTimer = 0;
+        private double sizeScale = 1.0;
+
 
         private Enemy(double x, double y, double radius, double hp, double speed, double contactDamage, int xpValue) {
             this.x = x;
@@ -850,6 +1285,29 @@ public class DiabloidGame {
             this.contactDamage = contactDamage;
             this.xpValue = xpValue;
             this.score = xpValue * 3;
+        }
+
+        void takeDamage(double damage) {
+            this.hp -= damage;
+
+            this.hitFlashTimer = 0.15;
+            this.sizeScale = 1.25;
+        }
+
+        void updateAnimation(double dt) {
+            if (hitFlashTimer > 0) {
+                hitFlashTimer -= dt;
+                if (sizeScale > 1.0) {
+                    sizeScale -= dt * 5.0;
+                    if (sizeScale < 1.0) sizeScale = 1.0;
+                }
+            } else {
+                sizeScale = 1.0;
+            }
+        }
+
+        double getCurrentRadius() {
+            return radius * sizeScale;
         }
     }
 
@@ -883,6 +1341,20 @@ public class DiabloidGame {
             this.x = x;
             this.y = y;
             this.value = value;
+        }
+    }
+
+    private static final class DamageNumber {
+        double x;
+        double y;
+        int value;
+        double alpha;
+
+        DamageNumber(double x, double y, int value) {
+            this.x = x;
+            this.y = y;
+            this.value = value;
+            this.alpha = 1.0;
         }
     }
 }
